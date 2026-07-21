@@ -44,6 +44,25 @@ user_systemctl() {
         systemctl --user "$@"
 }
 
+# Rebuild the initramfs. Both the patched modules and mb81-singlecmd.conf (the
+# cs420x softdep) are baked into it, and neither `dkms install` nor a plain
+# `cp` into /etc/modprobe.d updates it — Ubuntu's DKMS defaults REMAKE_INITRD
+# to "no". Skipping this leaves the machine booting a stale initrd: an old
+# generic linking against a new cs420x ("disagrees about version of symbol
+# snd_hda_gen_spec_init", err -22) and no softdep, so generic wins the codec
+# bind and the speaker is silent even though the card looks healthy.
+# Kept identical to dkms.sh's copy; install.sh runs it once at the end, with
+# MB81_SKIP_INITRAMFS=1 suppressing the nested one.
+refresh_initramfs() {
+    echo "=== refreshing initramfs (so new modules + softdep reach boot) ==="
+    if command -v update-initramfs > /dev/null; then
+        update-initramfs -u -k all
+    else
+        echo "WARNING: no update-initramfs found. Refresh the initramfs by hand,"
+        echo "         or the installed modules will NOT be the ones used at boot."
+    fi
+}
+
 if [[ $action == 'remove' ]]; then
     echo "=== removing suspend/resume recovery service ==="
     systemctl disable --now mb81-resume-recover.service 2>/dev/null || true
@@ -55,13 +74,16 @@ if [[ $action == 'remove' ]]; then
     rm -f /etc/systemd/user/mb81-jack-switch.service /usr/local/bin/mb81-jack-switch
     user_systemctl daemon-reload 2>/dev/null || true
     echo "=== removing DKMS package ==="
-    bash dkms.sh -r || true
+    # Defer the initramfs refresh: the modprobe.d conf is still on disk here,
+    # and refreshing now would bake it back in. Done once at the end instead.
+    MB81_SKIP_INITRAMFS=1 bash dkms.sh -r || true
     echo "=== removing config files ==="
     rm -f /etc/modprobe.d/mb81-singlecmd.conf
     rm -f "$pw_dir/51-macbook81-speaker.conf"
     rm -f "$wp_dir/51-mb81-rawpcm-speaker.conf"
     rm -f "$wp_dir/51-mb81-disable-iec958.conf"   # legacy name (pre raw-PCM)
     depmod -a
+    refresh_initramfs
     echo "DONE. Reboot to fall back to the stock in-tree drivers."
     exit 0
 fi
@@ -111,8 +133,11 @@ for kdir in /lib/modules/*/updates; do
 done
 
 echo "=== (A/C/D) building + installing the three modules via DKMS ==="
-bash dkms.sh
+# Defer dkms.sh's own refresh so the initramfs is rebuilt exactly once, below,
+# after both the modules and mb81-singlecmd.conf are in place.
+MB81_SKIP_INITRAMFS=1 bash dkms.sh
 depmod -a
+refresh_initramfs
 
 echo
 echo "================================================================"

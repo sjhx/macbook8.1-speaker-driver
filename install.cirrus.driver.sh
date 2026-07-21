@@ -36,30 +36,54 @@ hda_dir="$build_dir/hda"
 [[ -d $hda_dir ]] && rm -rf $hda_dir
 [[ ! -d $build_dir ]] && mkdir $build_dir
 
-# attempt to download linux-x.x.x.tar.xz kernel
-wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+# The build needs the kernel's hda source tree to compile the patched codecs
+# against. Normally that comes from the matching mainline tarball on kernel.org.
+# Ubuntu-versioned kernels (e.g. 26.04's "7.0.0") have NO mainline release there,
+# so fall back to the Ubuntu linux-source-<ver> package, which ships the exact
+# ABI-matched tree as /usr/src/linux-source-<ver>.tar.bz2.
+kernel_src_archive=''
+kernel_src_topdir=''
 
-if [[ $? -ne 0 ]]; then
-   # if first attempt fails, attempt to download linux-x.x.tar.xz kernel
-   kernel_version=$kernel_short_version
-   wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+# attempt to download linux-x.x.x.tar.xz, then linux-x.x.tar.xz, from kernel.org
+if wget -c "https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz" -P $build_dir; then
+    kernel_src_archive="$build_dir/linux-$kernel_version.tar.xz"
+    kernel_src_topdir="linux-$kernel_version"
+elif wget -c "https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_short_version.tar.xz" -P $build_dir; then
+    kernel_src_archive="$build_dir/linux-$kernel_short_version.tar.xz"
+    kernel_src_topdir="linux-$kernel_short_version"
 fi
 
-[[ $? -ne 0 ]] && echo "kernel could not be downloaded...exiting" && exit
+# No mainline tarball (Ubuntu-versioned kernel): use the Ubuntu linux-source pkg.
+if [[ -z $kernel_src_archive ]]; then
+    src_pkg="linux-source-$kernel_version"
+    pkg_tarball="/usr/src/$src_pkg.tar.bz2"
+    echo "=== kernel.org has no linux-$kernel_version; falling back to Ubuntu $src_pkg ==="
+    # Reuse an already-installed tarball if present; only touch apt when missing.
+    # (An apt-triggered DKMS rebuild already holds the dpkg lock, so pre-installing
+    # linux-source-$ver yourself avoids a self-deadlock in that path.)
+    if [[ ! -f $pkg_tarball ]]; then
+        apt-get install -y "$src_pkg" || { echo "could not install $src_pkg...exiting"; exit 1; }
+    fi
+    [[ -f $pkg_tarball ]] || { echo "$pkg_tarball missing after install...exiting"; exit 1; }
+    kernel_src_archive="$pkg_tarball"
+    # Detect the archive's top-level dir rather than assuming its name.
+    kernel_src_topdir="$(tar -tf "$kernel_src_archive" 2>/dev/null | head -1 | cut -d/ -f1)"
+    [[ -n $kernel_src_topdir ]] || { echo "could not read $kernel_src_archive...exiting"; exit 1; }
+fi
 
-# remove old kernel tar.xz archives
-find build/ -type f | grep -E linux.*.tar.xz | grep -v $kernel_version.tar.xz | xargs rm -f
+# remove stale kernel tar.xz archives from the build dir (keep the current one)
+find build/ -type f | grep -E 'linux.*\.tar\.xz' | grep -v "$(basename "$kernel_src_archive")" | xargs -r rm -f
 
 if (( major_version > 6 || (major_version == 6 && minor_version >= 17) )); then
     makefile_name="Makefile_cs420x"
-    tar --strip-components=2 -xvf $build_dir/linux-$kernel_version.tar.xz --directory=build/ linux-$kernel_version/sound/hda
+    tar --strip-components=2 -xvf "$kernel_src_archive" --directory=build/ "$kernel_src_topdir/sound/hda"
     mv $hda_dir/codecs/cirrus/Makefile $hda_dir/codecs/cirrus/Makefile.orig
     mv $hda_dir/codecs/cirrus/cs420x.c $hda_dir/codecs/cirrus/cs420x.c.orig
     cp $patch_dir/cs420x.c $patch_dir/patch_cirrus_macbook81_setup.h $patch_dir/patch_cirrus_a1534_setup.h $patch_dir/patch_cirrus_a1534_pcm.h $hda_dir/codecs/cirrus
     cp $patch_dir/$makefile_name $hda_dir/codecs/cirrus/Makefile
 else
     makefile_name="Makefile_cirrus"
-    tar --strip-components=3 -xvf $build_dir/linux-$kernel_version.tar.xz --directory=build/ linux-$kernel_version/sound/pci/hda
+    tar --strip-components=3 -xvf "$kernel_src_archive" --directory=build/ "$kernel_src_topdir/sound/pci/hda"
     mv $hda_dir/Makefile $hda_dir/Makefile.orig
     mv $hda_dir/patch_cirrus.c $hda_dir/patch_cirrus.c.orig
     cp $patch_dir/patch_cirrus.c $patch_dir/patch_cirrus_macbook81_setup.h $patch_dir/patch_cirrus_a1534_setup.h $patch_dir/patch_cirrus_a1534_pcm.h $hda_dir/

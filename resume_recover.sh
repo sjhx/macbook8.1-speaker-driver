@@ -67,10 +67,28 @@ echo "=== 3/5: driverless heal — efi_recover.py (clears 0x1f latch + EFI repla
 MB81_VERIFY_TONE=0 python3 "$HERE/efi_recover.py" || { echo "FAIL: efi_recover.py errored — reboot to recover."; exit 1; }
 
 echo "=== 4/5: re-attach the patched driver (no-reset + single_cmd, like boot) ==="
+# Pre-load the SPECIFIC CS4208 codec driver BEFORE the controller enumerates.
+# single_cmd=1 makes snd_hda_intel enumerate the codec almost instantly (immediate
+# verbs), faster than udev can pull cs420x from the codec modalias. If cs420x isn't
+# already registered, the always-present snd_hda_codec_generic wins the codec match
+# and binds it as "Cirrus Logic Generic" — no MacBook8,1 speaker fixup -> silence.
+# Loading cs420x first makes the specific driver win, exactly like the boot path.
+modprobe snd_hda_codec_cs420x
 modprobe snd_hda_intel
-sleep 3
-CODECF=$(grep -l 'Cirrus Logic CS4208' /proc/asound/card*/codec#0 2>/dev/null | head -1)
-[[ -z "$CODECF" ]] && { echo "FAIL: CS4208 did not re-enumerate — reboot to recover."; exit 1; }
+# Poll (not a fixed sleep) for the PATCHED CS4208 to enumerate — 'Cirrus Logic
+# CS4208', not the generic parser's 'Cirrus Logic Generic'.
+CODECF=''
+for _ in $(seq 1 20); do
+    CODECF=$(grep -l 'Cirrus Logic CS4208' /proc/asound/card*/codec#0 2>/dev/null | head -1)
+    [[ -n "$CODECF" ]] && break
+    sleep 0.5
+done
+if [[ -z "$CODECF" ]]; then
+    echo "FAIL: CS4208 did not re-enumerate under cs420x — reboot to recover."
+    grep -l 'Cirrus Logic Generic' /proc/asound/card*/codec#0 2>/dev/null | head -1 \
+        && echo "    (codec bound to the generic parser instead — cs420x lost the match)"
+    exit 1
+fi
 CARD=$(echo "$CODECF" | grep -oP 'card\K[0-9]+')
 DEV=/dev/snd/hwC${CARD}D0
 rdcoef(){ hda-verb "$DEV" 0x24 0x500 "$1" >/dev/null 2>&1
